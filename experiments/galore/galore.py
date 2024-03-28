@@ -80,9 +80,8 @@ class GaLoreProjector:
         return low_rank_matrix
 
 
+# TODO: AdamW with glore projection
 
- # TODO: AdamW with glore projection
- 
 if __name__ == "__main__":
     torch.manual_seed(0)
     rank: int = 2

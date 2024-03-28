@@ -14,6 +14,8 @@ from ohara.modules.norm import RMSNorm
 
 from dataclasses import dataclass
 
+from huggingface_hub import PyTorchModelHubMixin
+
 
 ## paper https://arxiv.org/abs/2402.19427
 
@@ -26,11 +28,19 @@ def scan(x: Tensor, h: Tensor) -> Tensor:
 
 
 @dataclass
-class Config:
+class ModelType:
+    MQA: str = "MQA"
+    Hawk: str = "Hawk"
+    Griffin: str = "Griffin"
+
+
+@dataclass
+class HnGConfig:
+    model_type: str = ModelType.Griffin  # MQA, Hawk, Griffin
     vocab_size: int = 51200
     seq_len: int = 2048  # keep in power of 2 for faster scan
     dim: int = 256  # keep in muliple of 128 as per paper
-    hidden_dim = dim * (3 / 2)
+    hidden_dim: int = dim * (3 / 2)
     num_heads: int = 32
     num_layers: int = 32
     dropout: float = 0.2
@@ -41,10 +51,12 @@ class Config:
     kernel_size: int = 4
     sliding_window_attention = False
     window_size: int = 128
+    weight_tying: bool = True
 
 
 class RG_LRU(nn.Module):
     def __init__(self, dim: int):
+        super().__init__()
         self.input_proj = nn.Linear(dim, dim)
         self.gate_proj = nn.Linear(dim, dim)
         self.forget_lambda = nn.Parameter(torch.linspace(-4.323, -9, dim))
@@ -99,7 +111,8 @@ class HawkMixer(nn.Module):
         self.output = nn.Linear(hidden_dim, dim, bias=False)
 
         with torch.no_grad():
-            self.proj.weight.normal_(std=dim**-0.5)
+            self.input_proj.weight.normal_(std=dim**-0.5)
+            self.gate_proj.weight.normal_(std=dim**-0.5)
             self.output.weight.normal_(std=hidden_dim**-0.5)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -107,8 +120,9 @@ class HawkMixer(nn.Module):
         # So linear rnn + conv can gets you close to transformer
         # to ssm hippo theory required :)
 
-        x = self.input_proj(x)
         gate = self.gate_proj(x)
+        x = self.input_proj(x)
+
         x = self.conv(x.mT)[..., :seq_len].mT
         h = self.linear_rnn(x)
         x = self.output(F.gelu(gate) * h)
@@ -128,7 +142,7 @@ class CasualMultiQueryAttention(nn.Module):
         super().__init__()
         self.num_heads: int = num_heads
         self.head_dim: int = dim // num_heads
-        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is None else num_heads
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.idx = idx
@@ -209,7 +223,7 @@ class CasualMultiQueryAttention(nn.Module):
 class MQABlock(nn.Module):
     def __init__(
         self,
-        cfg: Config,
+        cfg: HnGConfig,
         idx: int | None = None,
     ) -> None:
         super().__init__()
@@ -234,7 +248,7 @@ class MQABlock(nn.Module):
 class HawkBlock(nn.Module):
     def __init__(
         self,
-        cfg: Config,
+        cfg: HnGConfig,
         idx: int | None = None,
     ) -> None:
         super().__init__()
@@ -255,7 +269,7 @@ class HawkBlock(nn.Module):
 class GriffiBlock(nn.Module):
     def __init__(
         self,
-        cfg: Config,
+        cfg: HnGConfig,
         idx: int | None = None,
     ) -> None:
         super().__init__()
@@ -283,21 +297,25 @@ class GriffiBlock(nn.Module):
         return x
 
 
-class LLAMA(nn.Module):  # they refer this as MQA Base line
-    def __init__(self, cfg: Config, *args, **kwargs) -> None:
+class HawkAndGriffin(nn.Module, PyTorchModelHubMixin):  # they refer this as MQA Base line
+    def __init__(self, cfg: HnGConfig, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
         self.config = cfg
 
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
+        MODEL_TYPE = {"mqa": MQABlock, "hawk": HawkBlock, "griffin": GriffiBlock}
+        Block = MODEL_TYPE[cfg.model_type.lower()]
 
-        self.layers = nn.ModuleList([MQABlock(cfg, idx=idx) for idx in range(cfg.num_layers)])
+        self.layers = nn.ModuleList([Block(cfg, idx=idx) for idx in range(cfg.num_layers)])
 
         self.norm = nn.LayerNorm(cfg.dim)
         self.vocab_proj = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
 
-        # they did not use this in paper woth I dont think it matter for small models
-        # self.token_emb.weight = self.vocab_proj.weight
+        # they did not use weight tying in paper woth I dont think it matter for small models
+        # its keeps model size small (for small models lol)
+        if cfg.weight_tying:
+            self.token_emb.weight = self.vocab_proj.weight
         self.mask = self.build_mask(cfg.seq_len, cfg.sliding_window_attention, cfg.window_size)
 
         self.cis = precompute_freqs_cis(cfg.dim // cfg.num_heads, cfg.seq_len * 2)
@@ -325,125 +343,7 @@ class LLAMA(nn.Module):  # they refer this as MQA Base line
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def build_mask(seq_len, sliding_window_attention=False, window_size=1):
-        mask: Tensor = torch.full((seq_len, seq_len), float("-inf"))
-
-        assert window_size != 0, "window_size cannot be 0"
-        if not sliding_window_attention:
-            window_size = seq_len
-
-        row_indices: Tensor = torch.arange(seq_len).unsqueeze(-1)
-        col_indices: Tensor = torch.arange(seq_len)
-        distance = row_indices - col_indices
-
-        mask[(distance >= 0) & (distance <= (window_size - 1))] = 0
-
-        mask = mask.unsqueeze(0).unsqueeze(0)
-        return mask
-
-
-class Hawk(nn.Module):  # they refer this as MQA Base line
-    def __init__(self, cfg: Config, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.config = cfg
-
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
-
-        self.layers = nn.ModuleList([HawkBlock(cfg, idx=idx) for idx in range(cfg.num_layers)])
-
-        self.norm = nn.LayerNorm(cfg.dim)
-        self.vocab_proj = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
-
-        # they did not use this in paper woth I dont think it matter for small models
-        # self.token_emb.weight = self.vocab_proj.weight
-        self.mask = self.build_mask(cfg.seq_len, cfg.sliding_window_attention, cfg.window_size)
-
-        self.cis = precompute_freqs_cis(cfg.dim // cfg.num_heads, cfg.seq_len * 2)
-
-        self.apply(self._init_weights)
-
-    def forward(self, x: torch.Tensor):
-        _, seqlen = x.shape
-        x = self.token_emb(x)
-        device = self.token_emb.weight.device
-        freqs_cis = self.cis[0][:seqlen].to(device), self.cis[1][:seqlen].to(device)
-
-        for layer in self.layers:
-            x = layer(x, self.mask, freqs_cis)
-
-        x = self.norm(x)
-        x = self.vocab_proj(x)
-        return x
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def build_mask(seq_len, sliding_window_attention=False, window_size=1):
-        mask: Tensor = torch.full((seq_len, seq_len), float("-inf"))
-
-        assert window_size != 0, "window_size cannot be 0"
-        if not sliding_window_attention:
-            window_size = seq_len
-
-        row_indices: Tensor = torch.arange(seq_len).unsqueeze(-1)
-        col_indices: Tensor = torch.arange(seq_len)
-        distance = row_indices - col_indices
-
-        mask[(distance >= 0) & (distance <= (window_size - 1))] = 0
-
-        mask = mask.unsqueeze(0).unsqueeze(0)
-        return mask
-
-
-class Griffin(nn.Module):  # they refer this as MQA Base line
-    def __init__(self, cfg: Config, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-        self.config = cfg
-
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
-
-        self.layers = nn.ModuleList([GriffiBlock(cfg, idx=idx) for idx in range(cfg.num_layers)])
-
-        self.norm = nn.LayerNorm(cfg.dim)
-        self.vocab_proj = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
-
-        # they did not use this in paper woth I dont think it matter for small models
-        # self.token_emb.weight = self.vocab_proj.weight
-        self.mask = self.build_mask(cfg.seq_len, cfg.sliding_window_attention, cfg.window_size)
-
-        self.cis = precompute_freqs_cis(cfg.dim // cfg.num_heads, cfg.seq_len * 2)
-
-        self.apply(self._init_weights)
-
-    def forward(self, x: torch.Tensor):
-        _, seqlen = x.shape
-        x = self.token_emb(x)
-        device = self.token_emb.weight.device
-        freqs_cis = self.cis[0][:seqlen].to(device), self.cis[1][:seqlen].to(device)
-
-        for layer in self.layers:
-            x = layer(x, self.mask, freqs_cis)
-
-        x = self.norm(x)
-        x = self.vocab_proj(x)
-        return x
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def build_mask(seq_len, sliding_window_attention=False, window_size=1):
+    def build_mask(self, seq_len, sliding_window_attention=False, window_size=1):
         mask: Tensor = torch.full((seq_len, seq_len), float("-inf"))
 
         assert window_size != 0, "window_size cannot be 0"
